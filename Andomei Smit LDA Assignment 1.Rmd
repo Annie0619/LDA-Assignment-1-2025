@@ -1,0 +1,918 @@
+---
+title: "Longitudinal Data Analysis Assignment 1"
+author: "Andomei Smit: SMTAND051"
+date: "20/06/2025"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+    keep_tex: true
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.pos = 'H')
+library(nlme)
+library(faraway)
+library(lattice)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(MuMIn)
+```
+
+# Introduction
+We will assume that the treatment protocol is homogenous across different sites. This means that the same dose of the drugs will be given for different weight and age categories in the different sites. Assuming this allows us to not have to consider interactions between site and weight or site and age.
+
+```{r}
+# read in the data
+malaria <- read.csv("malariadata.csv")
+#head(malaria)
+
+# random sample carefully so that records stay complete
+set.seed(1997)
+# sample 75% of unique pids
+sampled_pids <- malaria %>%
+  distinct(pid) %>%
+  slice_sample(prop = 0.75) %>%
+  pull(pid)
+
+# keep all rows for those pids
+malaria <- malaria %>% semi_join(tibble(pid = sampled_pids), by = "pid")
+
+# order malaria by pid
+malaria <- malaria[order(malaria$pid, malaria$pday),]
+rm(sampled_pids)
+```
+
+# Data Cleaning
+It was noticed that some patients had less than 2 non-NA values for Haemoglobin. This is problematic when the aim is to model the profile of changes in Haemoglobin, thus all 53 patients for whom this was true were removed from the data.
+
+```{r echo=F, output=F}
+# remove pday 0 as per instructions
+#malaria <- malaria %>%
+ # filter(pday != 0)
+
+# closer look at NA within Hb
+malaria %>%
+  group_by(pday) %>%
+  summarise(n_NA_Hb = sum(is.na(Hb)))
+# no records are complete in terms of Hb..
+
+# remove subjects that only have 1 or less measures of Hb
+malaria <- malaria %>%
+  group_by(pid) %>%
+  filter(sum(!is.na(Hb)) >= 2) %>%
+  ungroup()
+
+# one person with Hb=0
+bad_pids <- malaria %>%
+  filter(Hb == 0) %>%
+  pull(pid) %>%
+  unique()
+## remove this person:
+malaria <- malaria %>%
+  filter(!pid %in% bad_pids)
+rm(bad_pids)
+
+# remove columns not relevant to this study:
+malaria <- malaria %>% select(-pardens, -gamedens, -Pyrconcentration, -Sulfconcentration, -PIoutcome, -PIoutcomeday)
+```
+
+
+```{r}
+# cast variables as factors
+malaria$site <- factor(malaria$site)
+malaria$gender <- factor(malaria$gender)
+malaria$arm <- factor(malaria$arm)
+
+# create grouped data
+malaria <-
+groupedData(Hb ~ pday | site/pid, # pid nested in site
+            data=malaria,
+            outer=~gender) # grouping variable
+#malaria
+```
+
+# EDA
+
+## Overall check of variables
+
+```{r}
+unique(malaria$site) # 4 unique sites
+unique(malaria$arm) # 2 different treatments
+
+# how many patients:
+length(unique(malaria$pid)) # 286
+
+unique(malaria$Studyyear) # all 2003, can drop it!
+unique(malaria$country) # all Mozambique, so can drop it!
+# drop these 2 variables:
+malaria <- malaria %>% select(-country, -Studyyear)
+
+# correlation between age and weight
+cor(malaria$age, malaria$weight, use="complete.obs") # very highly correlated! We will only use weight as that usually determines the dose for malaria medicine
+
+# correlation between age and Hb
+cor(malaria$age, malaria$Hb, use = "complete.obs")
+
+# correlation between weight and Hb
+cor(malaria$weight, malaria$Hb, use = "complete.obs")
+```
+
+## Specific Questions
+
+```{r}
+# how many subjects per site?
+malaria %>%
+  distinct(pid, site) %>%     # ensure one row per subject–site
+  count(site, name = "n_subjects")
+
+# collapse to north and south regions
+malaria <- malaria %>%
+  mutate(region = case_when(
+    site %in% c("Namaacha","Catuane","Boane") ~ "South",
+    site == "Magude" ~ "North",
+    TRUE ~ as.character(site)   # fallback in case of other sites
+  ))
+
+malaria$region <- as.factor(malaria$region)
+
+malaria %>%
+  distinct(pid, region) %>%     # ensure one row per subject–site
+  count(region, name = "n_subjects")
+```
+
+
+```{r}
+# are age and weight constant within patient?
+df_age_weight <- malaria %>%
+  group_by(pid) %>%
+  summarise(
+    n_age = n_distinct(age),
+    n_weight = n_distinct(weight)
+  ) %>%
+  # filter for only records where either age or weight has > 1 distinct values
+  filter(n_age > 1 | n_weight > 1)
+# empty data frame, thus age and weight are constant within patient
+rm(df_age_weight)
+
+# gender: are the males and females balanced?
+malaria %>%
+  distinct(pid, gender) %>%   
+  filter(gender == "F") %>%
+  summarise(n_females = n())
+# 170 of 286, roughly 60%
+
+# arm: are the treatments balanced?
+malaria %>%
+  distinct(pid, arm) %>%   
+  filter(arm == "SP") %>%
+  summarise(n_SP = n())
+# 139 out of 286 is SP, thus roughly balanced according to treatment
+
+# do both regions offer both treatments?
+malaria %>%
+  group_by(region, arm) %>%
+  summarise(n_unique_pid = n_distinct(pid), .groups = "drop")
+# roughly balanced between regions
+```
+The following code checks for various balances for different strata.
+
+```{r}
+# begin by summarising the data at pid level
+# Subject-level reductions
+subjects <- malaria %>%
+  arrange(pid, pday) %>%
+  group_by(pid) %>%
+  summarise(
+    arm     = dplyr::first(na.omit(arm)),
+    region    = dplyr::first(na.omit(region)),
+    gender  = dplyr::first(na.omit(gender)),
+    age     = dplyr::first(na.omit(age)),  
+    weight  = dplyr::first(na.omit(weight)),   
+    Hb0     = dplyr::first(na.omit(Hb)),       # baseline Hb (first pday)
+    Hb_mean = mean(Hb, na.rm = TRUE),          # subject mean Hb
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+# male/female split by region and arm
+subjects %>%
+  group_by(region, arm, gender) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(region, arm) %>%
+  mutate(prop = n / sum(n))
+```
+
+## Distribution of continuous covariates between regions and arm
+
+```{r}
+# summarise age by region and arm
+var_to_plot <- "age"
+
+# Boxplots/violin by arm within each region
+p_age <- ggplot(subjects, aes(x = arm, y = .data[[var_to_plot]], fill = arm)) +
+  geom_violin(trim = FALSE, alpha = 0.25, na.rm = TRUE, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = 21, na.rm = TRUE) +
+  facet_wrap(~ region, scales = "fixed") +
+  labs(x = "Arm", y = var_to_plot, title = paste("Distribution of", var_to_plot, "by Arm within Region")) +
+  theme_bw() + theme(legend.position = "none")
+
+ggsave("plots/age_dbn.pdf", plot = p_age, width = 5, height = 3)
+```
+
+```{r}
+var_to_plot <- "weight"
+
+# Boxplots/violin by arm within each region
+p_weight <- ggplot(subjects, aes(x = arm, y = .data[[var_to_plot]], fill = arm)) +
+  geom_violin(trim = FALSE, alpha = 0.25, na.rm = TRUE, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = 21, na.rm = TRUE) +
+  facet_wrap(~ region, scales = "fixed") +
+  labs(x = "Arm", y = var_to_plot, title = paste("Distribution of", var_to_plot, "by Arm within Region")) +
+  theme_bw() + theme(legend.position = "none")
+
+ggsave("plots/weight_dbn.pdf", plot = p_weight, width = 5, height = 3)
+```
+
+
+Distribution of continuous variables.
+```{r}
+# weight
+hist(malaria$weight) # also very skew
+hist(log(malaria$weight)) # dual peak
+
+# plot weight by gender
+p_weight_hist <- ggplot(filter(subjects, !is.na(weight)), aes(x = weight, fill = gender)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30) +
+  labs(
+    title = "Distribution of Weight by Gender",
+    x = "Weight (kg)",
+    y = "Count"
+  ) +
+  theme_bw()
+ggsave("plots/weight_gender_hist.pdf", plot = p_weight_hist, width = 4, height = 3)
+
+# log weight
+p_log_weight_hist <- ggplot(filter(subjects, !is.na(weight)), aes(x = log(weight), fill = gender)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30) +
+  labs(
+    title = "Distribution of log(Weight) by Gender",
+    x = "log(Weight)",
+    y = "Count"
+  ) +
+  theme_bw()
+ggsave("plots/log_weight_gender_hist.pdf", plot = p_log_weight_hist, width = 4, height = 3)
+
+# log the weight in the dataset:
+malaria$weight <- log(malaria$weight)
+
+# distribution of the response:
+## seems very normally distributed
+g_hb_hist <- ggplot(filter(subjects, !is.na(Hb0)), aes(x = Hb0)) +
+  geom_histogram(fill = "lightgreen", color = "darkgreen", bins = 30) +
+  labs(
+    title = "Distribution of Baseline Haemoglobin",
+    x = "Hb (g/dL)",
+    y = "Count"
+  ) +
+  theme_bw()
+ggsave("plots/hb_hist.pdf", plot = g_hb_hist, height = 3, width = 5)
+
+rm(g_hb_hist)
+rm(p_age)
+rm(p_log_weight_hist)
+rm(p_weight)
+rm(p_weight_hist)
+rm(var_to_plot)
+```
+
+
+## Subject profiles
+
+```{r}
+xyplot(Hb~pday|arm, malaria,
+       type = "l", groups = pid)
+
+# now remove day 0, 1 and 2
+malaria_no_0 <- malaria %>%
+  filter(!pday %in% c(0,1,2))
+
+pdf("plots/subject_profiles.pdf", width = 5, height = 3)
+xyplot(Hb~pday|arm, malaria_no_0,
+       type = "l", groups = pid, main = "Subject Profiles by Treatment Arm")
+dev.off()
+```
+
+```{r}
+# testing for arm*region interaction
+#xyplot(Hb ~ pday | region * arm, data = malaria_noNA,
+      # groups = pid, type = "l", auto.key = FALSE)
+```
+
+## Investigate interactions
+
+```{r}
+malaria_noNA <- malaria[!is.na(malaria$Hb), ]
+```
+
+### Treatment related interactions
+
+```{r}
+# arm*pday interactions:
+## does Hb trajectory differ between treatment arms? (The main question of this project)
+pdf("plots/arm_pday_int.pdf", width = 6, height = 4)
+with(malaria_noNA,
+     interaction.plot(x.factor = pday,
+                      trace.factor = arm,
+                      response = Hb,
+                      las = 1,
+                      type = "b",   
+                      pch = 16,     
+                      col = c("darkgreen","lightblue"),
+                      legend = FALSE,
+                      main = "Haemoglobin by Treatment Arm\n over Time")) 
+legend("top", inset = c(-0.2, 0),   # move outside
+       legend = levels(malaria_noNA$arm),
+       col = c("darkgreen","lightblue"),
+       pch = 16, bty = "n", xpd = TRUE)
+dev.off()
+```
+
+
+```{r}
+# interaction between arm*gender
+## Does the treatment effect differ between males and females, on average?
+p_gender_arm <- malaria_noNA %>%
+  group_by(pday, arm, gender) %>%
+  summarise(mean_Hb = mean(Hb, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = pday, y = mean_Hb, color = gender, group = gender)) +
+  geom_line(linewidth = 1) +
+  geom_point(shape = 16, size = 2) +
+  facet_wrap(~ arm) +   # now split panels by treatment arm
+  scale_color_manual(values = c("purple","lightblue")) +
+  labs(
+    title = "Haemoglobin by Gender\nwithin Treatment Arms",
+    x = "Day", y = "Mean Hb"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+ggsave("plots/gender_arm_int.pdf", plot = p_gender_arm, width = 5, height = 3)
+```
+
+```{r}
+# interaction between arm*weight
+## Does the treatment effect vary by patient weight?
+## no nice way to visualise this, but will include in formal testing.
+```
+
+
+### Time related interactions
+
+```{r}
+# interaction between gender*pday
+## Do males and females have different Hb trajectories over time, regardless of arm?
+## based on the lines being very similar, we probably won't include it
+pdf("plots/gender_time_int.pdf", width = 6, height = 4)
+with(malaria_noNA,
+     interaction.plot(x.factor = pday,
+                      trace.factor = gender,
+                      response = Hb,
+                      las = 1,
+                      type = "b",   
+                      pch = 16,    
+                      col = c("darkgreen","lightblue"),
+                      legend = FALSE,
+                      main = "Haemoglobin by Gender over Time")) 
+legend("top", inset = c(-0.2, 0),   # move outside
+       legend = levels(malaria_noNA$gender),
+       col = c("darkgreen","lightblue"),
+       pch = 16, bty = "n", xpd = TRUE)
+dev.off()
+```
+
+```{r}
+# interaction between region*pday
+## Do Hb trajectories differ across regions?
+## keep to test if there may be some other factors we are missing?
+pdf("plots/region_time_int.pdf", width = 6, height = 4)
+with(malaria_noNA,
+     interaction.plot(x.factor = pday,
+                      trace.factor = region,
+                      response = Hb,
+                      las = 1,
+                      type = "b",   # lines+points
+                      pch = 16,     # solid circle instead of "1"/"2"
+                      col = c("darkgreen","lightblue"),
+                      legend = FALSE,
+                      main = "Haemoglobin by Region over Time"))
+legend("top", inset = c(-0.2, 0),   # move outside
+       legend = levels(malaria_noNA$region),
+       col = c("darkgreen","lightblue"),
+       pch = 16, bty = "n", xpd = TRUE)
+dev.off()
+```
+
+```{r}
+# interaction between weight*pday
+## Do heavier/lighter patients recover Hb at different rates?
+## also not nice to visualize, thus will test formally.
+```
+
+### Three-way interactions
+IGNORE THESE.
+
+```{r}
+malaria %>%
+  distinct(pid, arm, gender, pday) %>%   # ensure one row per subject per subgroup
+  count(arm, gender, pday, name = "n_subjects") %>%
+  arrange(pday, arm, gender)
+```
+
+```{r}
+# interaction between arm*pday*gender
+pdf("plots/gender_arm_time_int.pdf", width = 6, height = 4)
+
+op <- par(mar = c(5, 4, 4, 9) + 0.1,  # extra right margin
+          xpd = NA)                   # allow drawing into margins
+
+df <- subset(malaria_noNA, !is.na(Hb))
+tf <- with(df, interaction(arm, gender, drop = TRUE, sep = " × "))
+cols <- seq_along(levels(tf))
+
+interaction.plot(x.factor = df$pday,
+                 trace.factor = tf,
+                 response = df$Hb,
+                 fun = mean,
+                 type = "b", pch = 16, lwd = 1.5,
+                 las = 1, xlab = "Day", ylab = "Mean Hb",
+                 col = cols, legend = FALSE,
+                 main = "Haemoglobin by Gender and\nTreatment Arm over Time")
+
+legend("right", inset = c(-0.5, 0),   # into the enlarged right margin
+       legend = levels(tf),
+       col = cols, pch = 16, lwd = 1.5, bty = "n")
+
+par(op)
+dev.off()
+```
+
+
+## Dropout rate
+```{r}
+# time on study/ dropout pattern
+## summarise the number of values for Hb at each day
+malaria %>%
+  group_by(pday, arm) %>%
+  summarise(n_nonNA = sum(!is.na(Hb)), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from  = arm,
+    values_from = n_nonNA
+  )
+
+
+last_obs <- malaria %>%
+  filter(!is.na(Hb)) %>%                 # only rows where Hb is observed
+  group_by(pid) %>%
+  summarise(
+    last_pday = max(pday),               # last day observed for that pid
+    n_obs     = n(),                     # how many Hb measurements they have
+    .groups = "drop"
+  )
+
+subjects <- malaria %>% distinct(pid, arm, region, site)
+
+# counts of last observed day by arm
+last_by_arm <- last_obs %>%
+  left_join(subjects, by = "pid") %>%
+  count(arm, last_pday, name = "n_subjects") %>%
+  tidyr::pivot_wider(names_from = arm, values_from = n_subjects, values_fill = 0)
+
+unique_days <- sort(unique(malaria$pday))
+
+retention <- dplyr::bind_rows(lapply(unique_days, function(d) {
+  last_obs %>%
+    left_join(subjects, by = "pid") %>%
+    group_by(arm) %>%
+    summarise(n_at_least_d = sum(!is.na(last_pday) & last_pday >= d), .groups = "drop") %>%
+    mutate(pday = d)
+}))
+
+
+p_ret <- ggplot(retention, aes(x = pday, y = n_at_least_d, color = arm)) +
+   geom_line(linewidth = 1) + 
+  geom_point() +
+   labs(y = "Subjects with Hb observed ≥ day", title = "Retention over time by Arm")+
+  theme_bw()
+ggsave("plots/retention_arm.pdf", plot = p_ret, height = 3, width = 5)
+```
+
+```{r}
+# retention by region
+last_obs <- malaria %>%
+  filter(!is.na(Hb)) %>%
+  group_by(pid) %>%
+  summarise(last_pday = max(pday), .groups = "drop")
+
+# attach region info
+subjects <- malaria %>% distinct(pid, region)
+last_obs <- left_join(last_obs, subjects, by = "pid")
+
+unique_days <- sort(unique(malaria$pday))
+
+retention_region <- bind_rows(lapply(unique_days, function(d) {
+  last_obs %>%
+    group_by(region) %>%
+    summarise(
+      n_at_least_d = sum(!is.na(last_pday) & last_pday >= d),
+      .groups = "drop"
+    ) %>%
+    mutate(pday = d)
+}))
+
+p_ret_reg <- ggplot(retention_region, aes(x = pday, y = n_at_least_d, color = region)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(
+    x = "Day",
+    y = "Subjects with Hb observed ≥ day",
+    title = "Retention over time by Region"
+  ) +
+  theme_bw()
+ggsave("plots/retention_region.pdf", plot = p_ret_reg, width = 5, height = 3)
+```
+
+# Modeling notes
+
+## Remove day 0
+
+```{r}
+# remove day 0 so that we only look at the difference in recovery after treatment onset
+# since day 1 and 2 are all NA, remove them too.
+malaria <- malaria %>%
+  filter(!pday %in% c(0,1,2))
+
+# also remove observations with NA in weight
+colSums(is.na(malaria)) # weight still has 6 NA, so remove.
+malaria_noNA <- malaria[!is.na(malaria$weight),]
+```
+
+```{r}
+# create dataframe for this plot:
+malaria_noNA_hb <- malaria[!is.na(malaria$Hb), ]
+pdf("plots/arm_pday_int_no_day_0.pdf", width = 6, height = 4)
+with(malaria_noNA_hb,
+     interaction.plot(x.factor = pday,
+                      trace.factor = arm,
+                      response = Hb,
+                      las = 1,
+                      type = "b",  
+                      pch = 16,     
+                      col = c("darkgreen","lightblue"),
+                      legend = FALSE,
+                      main = "Haemoglobin by Treatment Arm\n over Time")) 
+legend("top", inset = c(-0.2, 0),   # move outside
+       legend = levels(malaria_noNA$arm),
+       col = c("darkgreen","lightblue"),
+       pch = 16, bty = "n", xpd = TRUE)
+dev.off()
+rm(malaria_noNA_hb)
+```
+
+## Most basic model
+The most basic model will be one with only pday and a random intercept. Note that we fit the model with ML since we will at first be investigating changes in the fixed effects and trying to compare AIC. After the final fixed effect structure is chosen, we will change the method back to REML.
+
+```{r}
+m0 <- lme(Hb ~ pday, # one overall slope for Hb over time
+          random = ~1 | pid, # only a random intercept for pid
+          data = malaria_noNA, na.action = na.omit, method = "ML")
+summary(m0)
+```
+
+## Add the treatment arm
+
+```{r}
+# note: still using ML!
+m1 <- update(m0, fixed = Hb~ pday + arm)
+# test if it's significant
+```
+
+```{r}
+# compare:
+anova(m0, m1) # it is significant
+# remove m0
+#rm(m0)
+```
+
+## Adding covariates
+We will now test to see if we should be adding covariates. We will consider weight, gender and region
+
+### weight
+
+```{r}
+m2 <- update(m1,fixed = Hb ~ arm + pday + weight)
+# compare with m1
+anova(m1, m2) # log weight is significant
+# remove m1
+#rm(m1)
+```
+
+### gender
+
+```{r}
+m3 <- update(m2, fixed = Hb ~ arm + pday + weight + gender)
+# compare with m2
+anova(m2, m3) # gender is significant
+# remove m2
+#rm(m2)
+```
+
+### region
+
+```{r}
+m4 <- update(m3, fixed = Hb ~ arm + pday + weight + gender + region)
+# compare with m4
+anova(m3, m4) # region is not significant
+# remove m4
+#rm(m4)
+```
+
+## Adding interactions
+
+### arm*pday
+
+```{r}
+m5 <- update(m3, fixed = Hb ~ arm*pday + weight + gender)
+summary(m5) # also note the tiny effect size here!
+# compare
+anova(m3, m5) # not significant
+# remove m5
+#rm(m5)
+```
+
+### arm*gender
+
+```{r}
+m6 <- update(m3, fixed = Hb ~ pday + weight + arm*gender)
+summary(m6)
+# compare with m3
+anova(m3, m6) # arm*gender interaction not significant
+# remove m6
+#rm(m6)
+```
+
+### arm*weight
+
+```{r}
+m7 <- update(m3, fixed = Hb ~ arm*weight + pday + gender)
+summary(m7)
+# compare with m3
+anova(m3, m7) # arm*weight interaction not significant
+# remove m7
+#rm(m7)
+```
+
+### pday*region
+
+```{r}
+m8 <- update(m3, fixed = Hb ~ arm + pday + weight + gender + pday*region)
+summary(m8)
+# compare with m3
+anova(m3, m8) # pday*region interaction not significant
+# remove m8
+#rm(m8)
+```
+
+### pday*weight
+
+```{r}
+m9 <- update(m3, fixed = Hb ~ arm + pday*weight + gender)
+summary(m9)
+# compare with m3
+anova(m3, m9) # pday*weight interaction is significant
+# remove m3
+#rm(m3)
+```
+
+
+## Change the estimation method
+Since we have finalized the fixed effects, we can update the estimation method to REML.
+
+```{r}
+fe_final <- lme(Hb ~ arm + pday*weight + gender, # final fixed effects
+          random = ~1 | pid, # only a random intercept for pid
+          data = malaria_noNA, na.action = na.exclude, method = "REML")
+rm(m9)
+summary(fe_final) # note standard errors seem stable
+```
+
+## Adding random slope
+
+```{r}
+mean_pday <- mean(malaria_noNA$pday, na.rm = TRUE)
+m1_slope <- update(fe_final, random =~1+pday|pid)
+summary(m1_slope)
+# compare the two models
+anova(fe_final, m1_slope) # slope is significant
+```
+
+## Investigate variance structures
+
+```{r}
+# create dataframe for plotting
+diag_df <- data.frame(
+  e    = resid(m1_slope, type = "normalized"),
+  f    = fitted(m1_slope),
+  arm  = malaria_noNA$arm,
+  region = malaria_noNA$region,
+  gender = malaria_noNA$gender,
+  pday = malaria_noNA$pday
+)
+```
+
+
+```{r}
+# plot of residuals by arm and region
+p_resid_arm <- ggplot(diag_df, aes(x = arm, y = e, fill = arm)) +
+  geom_violin(trim = FALSE, alpha = 0.25, na.rm = TRUE, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = 21, na.rm = TRUE) +
+  facet_wrap(~ region, scales = "fixed") +   
+  labs(
+    x = "Treatment Arm",
+    y = "Normalized residuals",
+    title = "Distribution of residuals by Arm within Region"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+ggsave("plots/resid_var_arm.pdf", plot = p_resid_arm, height = 3, width = 5)
+```
+
+```{r}
+# plot of residuals by arm and gender
+p_resid_arm_gender <- ggplot(diag_df, aes(x = arm, y = e, fill = arm)) +
+  geom_violin(trim = FALSE, alpha = 0.25, na.rm = TRUE, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = 21, na.rm = TRUE) +
+  facet_wrap(~ gender, scales = "fixed") +
+  labs(
+    x = "Treatment Arm",
+    y = "Normalized residuals",
+    title = "Distribution of residuals by Arm within Gender"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+ggsave("plots/resid_var_gender.pdf", plot = p_resid_arm_gender, height = 3, width = 5)
+```
+
+
+```{r}
+# spread of residuals by day
+p_abs_byday <- ggplot(diag_df, aes(x = pday, y = abs(e))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  scale_x_continuous(breaks = sort(unique(diag_df$pday))) +
+  labs(x = "Day", y = "|Normalized residual|",
+       title = "Residual spread over time") +
+  theme_bw(base_size = 12)
+
+# variance doesn't increase over time
+ggsave("plots/resid_var_time.pdf", plot = p_abs_byday, height = 3, width = 5)
+```
+
+
+```{r}
+diag_df <- subset(diag_df, !is.na(e))           
+diag_df$arm    <- factor(diag_df$arm)
+diag_df$gender <- factor(diag_df$gender)
+
+# Residuals vs Fitted with LM line
+p_resid_fit <- ggplot(diag_df, aes(x = f, y = e)) +
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.6) +
+  geom_point(alpha = 0.5) +
+  labs(
+    x = "Fitted Hb",
+    y = "Normalized residuals",
+    title = "Residuals vs Fitted"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+#p_resid_fit
+ggsave("plots/resid_vs_fitted.pdf", plot = p_resid_fit, height = 3, width = 3)
+```
+
+
+```{r}
+# just to be safe, let's fit one such models and test
+# we use a variance that increases/ decreases as a power of the mean
+# this is commonly used if the residual spread grows with fitted values of Hb (which is common in biology)
+m_powerVar <- update(m1_slope, weights = varPower(form = ~ fitted(.)))
+anova(m1_slope, m_powerVar) # very large p-value, not significant
+```
+
+## Investigate correlation structure
+
+
+```{r}
+m_car1 <- update(m1_slope, correlation = corCAR1(form = ~ pday | pid))
+AIC(m_car1, m1_slope) # so close together!
+anova(m_car1, m1_slope)
+
+# compare the autocorrelation functions
+acf_resid <- ACF(m1_slope, resType = "normalized")
+pdf("plots/acf_original.pdf", height = 3, width = 4)
+plot(acf_resid, main = "Autocorrelation Function for\n uncorrelated model")
+dev.off()
+
+acf_resid_car1 <- ACF(m_car1, resType = "normalized")
+
+pdf("plots/acf_car1.pdf", height = 3, width = 4)
+plot(acf_resid_car1, main = "Autocorrelation Function for \n CAR(1) model")
+dev.off()
+
+# this seems negligible. We can conclude that the random slope already accounts for the majority of the trajectory
+# final model: m1_slope
+```
+
+# Model Checking
+Let's see if the model violates any assumptions.
+
+```{r}
+# assumptions:
+## Normality
+# residuals
+e <- resid(m1_slope, type = "normalized")
+f <- fitted(m1_slope)
+
+# QQ plot
+pdf("plots/qq_plot.pdf", width = 4, height = 4)
+qqnorm(e); qqline(e)
+dev.off()
+
+# Histogram
+pdf("plots/resid_hist.pdf", width = 6, height = 4)
+hist(e, breaks = 30, col = "lightgreen", main = "Histogram of Standardised Residuals", xlab = "Standardised Residuals")
+dev.off()
+```
+
+```{r}
+# homoscedasticity:
+## already checked above
+
+# serial correlations (errors are uncorrelated)
+## already checked above
+```
+
+```{r}
+# check distribution of the random effects
+re <- ranef(m1_slope)   # random effects per pid
+pdf("plots/qq_random_int.pdf", height = 4, width = 4)
+qqnorm(re[,1], main = "Q-Q plot of Random Intercepts"); qqline(re[,1])   # intercepts
+dev.off()
+pdf("plots/qq_random_slope.pdf", height = 4, width = 4)
+qqnorm(re[,2], main = "Q-Q plot of Random Slopes"); qqline(re[,2])   # slopes
+dev.off()
+```
+
+```{r}
+# outliers and influential observations
+pdf("plots/boxplot_pid_resid.pdf", width = 9, height = 4)
+boxplot(e ~ malaria_noNA$pid, main = "Boxplot of Residuals for each Subject", xlab = "Subject (pid)", ylab ="Standardised Residuals")  # check subject-level spread
+dev.off()
+# seems to be some slight outliers, could be the reason for the mis-fit in QQ-plot
+```
+
+```{r}
+# goodness of fit test
+r.squaredGLMM(m1_slope) # proportion of variance explained by fixed effects vs full model
+```
+
+# Model conclusions
+
+```{r}
+summary(m1_slope)$tTable   # fixed effects table
+# armSP/ART  shows difference the average  Hb between arms across the study period, holding gender, weight and time constant
+# on average, SP/ART had Hb reading 0.32 higher than SP
+# CI:
+arm_std_er <- summary(m1_slope)$tTable[2,2]
+arm_val <- summary(m1_slope)$tTable[2,1]
+arm_val-1.96*arm_std_er
+arm_val+1.96*arm_std_er
+```
+
+
+
+
